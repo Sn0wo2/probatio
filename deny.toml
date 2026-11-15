@@ -1,0 +1,5 @@
+[graph]
+all-features = true
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "MPL-2.0", "Unicode-3.0", "Unlicense", "Zlib", "0BSD", "ISC", "BSD-3-Clause"]

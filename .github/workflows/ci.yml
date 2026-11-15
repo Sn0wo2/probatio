@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      has_library: ${{ steps.metadata.outputs.has_library }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Collect workspace metadata
+        id: metadata
+        run: node scripts/collect-ci-metadata.js
+
+      - name: Apply lint fixes
+        continue-on-error: true
+        run: |
+          cargo fmt-all
+          cargo lint-fix
+
+      - name: Save lint fixes
+        id: patch
+        if: ${{ !cancelled() }}
+        run: |
+          if ! git diff --quiet -- '*.rs'; then
+            git diff --binary -- '*.rs' > "$RUNNER_TEMP/lint-fixes.patch"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git restore --worktree -- '*.rs'
+          fi
+
+      - run: |
+          cargo fmt-check
+          cargo lint
+          cargo check-ws
+          cargo check-no-default
+          cargo test-ws
+          cargo test-all-features
+          cargo test-no-default
+          cargo doc-all
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Checkout the branch for autofix
+        id: autofix_checkout
+        if: >-
+          !cancelled() && steps.patch.outputs.changed == 'true' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          persist-credentials: false
+
+      - name: Apply lint fixes
+        id: apply_fix
+        if: ${{ !cancelled() && steps.autofix_checkout.outcome == 'success' }}
+        run: git apply --include='*.rs' "$RUNNER_TEMP/lint-fixes.patch"
+
+      - name: Create autofix pull request
+        id: autofix_pr
+        continue-on-error: true
+        if: ${{ !cancelled() && steps.apply_fix.outcome == 'success' }}
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(autofix): formatting and lint"
+          branch: auto-fix/rust-${{ github.event.pull_request.number || github.ref_name }}
+          delete-branch: true
+          title: "chore(autofix): formatting and lint"
+          body: "Automated rustfmt and Clippy fixes from CI"
+          labels: automated,rust
+          add-paths: "**/*.rs"
+
+      - name: Upload lint fixes if pull request creation fails
+        if: ${{ !cancelled() && steps.autofix_pr.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: lint-fixes
+          path: ${{ runner.temp }}/lint-fixes.patch
+          if-no-files-found: error
+          retention-days: 7
+
+  audit:
+    name: Audit dependencies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - run: cargo audit
+
+  geiger:
+    name: Unsafe code report
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+
+      - name: Scan unsafe code
+        continue-on-error: true
+        run: cargo +nightly geiger --all-features --output-format GitHubMarkdown >> "$GITHUB_STEP_SUMMARY"
+
+  semver:
+    name: Semantic versioning
+    needs: check
+    if: needs.check.outputs.has_library == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: obi1kenobi/cargo-semver-checks-action@v2

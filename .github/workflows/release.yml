@@ -1,0 +1,251 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (e.g. 0.1.1)
+        required: true
+        type: string
+      snapshot:
+        description: Build a snapshot without bumping, tagging, or publishing
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.snapshot && format('snapshot-{0}', github.ref) || 'publish' }}
+  cancel-in-progress: ${{ inputs.snapshot == true }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: read
+    outputs:
+      skip: ${{ steps.release.outputs.skip }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha || steps.metadata.outputs.sha }}
+      has_publishable_crates: ${{ steps.metadata.outputs.has_publishable_crates }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ (github.event_name == 'push' || inputs.snapshot) && github.ref || github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Normalize version
+        id: version
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          version=${RELEASE_VERSION#v}
+          if [[ $version != [0-9]* || $(npm exec --yes --package=semver@7 -- semver "$version") != "${version%%+*}" ]]; then
+            echo "Invalid semantic version: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check for an already published release
+        id: release
+        if: ${{ !inputs.snapshot }}
+        run: node scripts/check-release.js "$RELEASE_TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ steps.version.outputs.version }}
+
+      - name: Resume an existing release tag
+        id: tag
+        if: github.event_name == 'workflow_dispatch' && !inputs.snapshot && steps.release.outputs.skip != 'true'
+        run: |
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            git checkout --detach "v$VERSION"
+            echo "retry=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.release.outputs.skip != 'true'
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.release.outputs.skip != 'true'
+        with:
+          shared-key: check
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - uses: taiki-e/install-action@v2
+        if: ${{ !inputs.snapshot && steps.release.outputs.skip != 'true' }}
+        with:
+          tool: cargo-edit
+
+      - name: Sync workspace version
+        id: sync
+        if: ${{ !inputs.snapshot && steps.release.outputs.skip != 'true' }}
+        run: |
+          cargo set-version --workspace "$VERSION"
+          if ! git diff --quiet -- '*Cargo.toml' Cargo.lock; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect release metadata
+        id: metadata
+        if: steps.release.outputs.skip != 'true'
+        run: node scripts/collect-release-metadata.js
+        env:
+          VERIFY_VERSION: ${{ !inputs.snapshot }}
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Detect reusable CI checks
+        id: ci
+        if: >-
+          github.event_name == 'push' && steps.release.outputs.skip != 'true' &&
+          steps.sync.outputs.changed != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?check_name=Checks" --jq '.total_count')" -gt 0 ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reuse CI checks for this commit
+        if: >-
+          github.event_name == 'push' && steps.release.outputs.skip != 'true' &&
+          steps.sync.outputs.changed != 'true' && steps.ci.outputs.found == 'true'
+        timeout-minutes: 15
+        uses: lewagon/wait-on-check-action@v1.9.1
+        with:
+          ref: ${{ steps.metadata.outputs.sha }}
+          check-name: Checks
+          repo-token: ${{ github.token }}
+          allowed-conclusions: success
+
+      - name: Check the release candidate
+        if: >-
+          steps.release.outputs.skip != 'true' &&
+          (github.event_name == 'workflow_dispatch' || steps.sync.outputs.changed == 'true' ||
+          steps.ci.outputs.found != 'true')
+        run: |
+          cargo fmt-check
+          cargo lint
+          cargo check-ws
+          cargo check-no-default
+          cargo test-ws
+          cargo test-all-features
+          cargo test-no-default
+          cargo doc-all
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        if: >-
+          steps.release.outputs.skip != 'true' &&
+          (github.event_name == 'workflow_dispatch' || steps.sync.outputs.changed == 'true' ||
+          steps.ci.outputs.found != 'true')
+
+      - name: Commit and publish the checked version
+        id: commit
+        if: ${{ !inputs.snapshot && steps.release.outputs.skip != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -u -- '*Cargo.toml' Cargo.lock
+          if git diff --cached --quiet && git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            release_sha=$(git rev-parse HEAD)
+            if [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" != "$release_sha" ]; then
+              echo "Tag v$VERSION does not point to HEAD" >&2
+              exit 1
+            fi
+            remote_sha=$(git -c credential.helper='!gh auth git-credential' ls-remote --refs origin "refs/tags/v$VERSION" | cut -f1)
+            if [ -n "$remote_sha" ] && [ "$remote_sha" != "$(git rev-parse "refs/tags/v$VERSION")" ]; then
+              echo "Remote tag v$VERSION differs from the local tag" >&2
+              exit 1
+            fi
+            git -c credential.helper='!gh auth git-credential' fetch --no-tags origin "$DEFAULT_BRANCH"
+            if git merge-base --is-ancestor "$release_sha" FETCH_HEAD; then
+              ancestry=0
+            else
+              ancestry=$?
+            fi
+            if [ "$ancestry" -ne 0 ] && [ "$ancestry" -ne 1 ]; then
+              echo "Could not check remote branch ancestry" >&2
+              exit 1
+            fi
+            refs=()
+            if [ "$ancestry" -eq 1 ]; then refs+=("HEAD:refs/heads/$DEFAULT_BRANCH"); fi
+            if [ -z "$remote_sha" ]; then refs+=("refs/tags/v$VERSION:refs/tags/v$VERSION"); fi
+            if [ "${#refs[@]}" -gt 0 ]; then
+              git -c credential.helper='!gh auth git-credential' push --atomic origin "${refs[@]}"
+            fi
+            echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+            echo "Tag v$VERSION already points at the checked version; nothing to commit."
+            exit 0
+          fi
+          git diff --cached --quiet || git commit -m "chore(release): bump version to $VERSION"
+          release_sha=$(git rev-parse HEAD)
+          if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
+            git fetch origin "$DEFAULT_BRANCH"
+            git checkout --detach FETCH_HEAD
+            git cherry-pick "$release_sha"
+            release_sha=$(git rev-parse HEAD)
+            git -c credential.helper='!gh auth git-credential' push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          else
+            git tag "v$VERSION"
+            git -c credential.helper='!gh auth git-credential' push --atomic origin "HEAD:refs/heads/$DEFAULT_BRANCH" "refs/tags/v$VERSION"
+          fi
+          echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: prepare
+    if: >-
+      !cancelled() && !inputs.snapshot && needs.prepare.result == 'success' &&
+      needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.prepare.outputs.has_publishable_crates == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: needs.prepare.outputs.has_publishable_crates == 'true'
+        with:
+          shared-key: check
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - uses: katyo/publish-crates@v2
+        if: needs.prepare.outputs.has_publishable_crates == 'true'
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          args: --allow-dirty
+
+      - name: Prepare publishing configuration
+        run: |
+          cp .goreleaser.yml "$RUNNER_TEMP/goreleaser-publish.yml"
+          printf '\ndist: %s\n' "$RUNNER_TEMP/goreleaser-publish" >> "$RUNNER_TEMP/goreleaser-publish.yml"
+
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          args: release --skip=before,archive,validate --config=${{ runner.temp }}/goreleaser-publish.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
